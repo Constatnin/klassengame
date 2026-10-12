@@ -311,11 +311,12 @@ class Brawler:
         self.network_error = ""
 
     def process_network(self):
-        if self.network is None:
+        connection = self.network
+        if connection is None:
             return
         while True:
             try:
-                message = self.network.messages.get_nowait()
+                message = connection.messages.get_nowait()
             except queue.Empty:
                 break
             kind = message.get("type")
@@ -333,7 +334,7 @@ class Brawler:
                     self.network = None
                     self.network_role = None
                     self.game_state = "menu"
-                    continue
+                    break
                 self.remote_brawler = brawler
                 self.network_status = f"Gegner: {BRAWLERS[brawler]['name']}"
                 if self.network_role == "host":
@@ -349,11 +350,12 @@ class Brawler:
             elif kind == "error":
                 self.network_error = f"Netzwerkfehler: {message.get('message', 'Unbekannter Fehler')}"
                 if self.game_state in ("connecting", "lobby"):
-                    self.network.close()
+                    connection.close()
                     self.network = None
                     self.network_role = None
                     self.game_state = "menu"
                 self.network_status = self.network_error
+                break
             elif kind == "disconnected":
                 self.network_status = "Verbindung zum Mitspieler verloren."
                 self.network_error = self.network_status
