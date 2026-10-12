@@ -1,3 +1,4 @@
+import ipaddress
 import math
 import json
 import queue
@@ -192,22 +193,40 @@ class Brawler:
         self.last_network_send = 0
         self.remote_input = {}
         self.remote_dash_cooldown = 0
+        self.player = None
+        self.opponent = None
+        self.remote_brawler = 0
         self.reset()
 
-    def reset(self):
+    def stop_network(self):
         if self.network is not None:
             self.network.close()
-        self.network = None
+            self.network = None
         self.network_role = None
+        self.network_status = ""
+        self.network_error = ""
+        self.remote_input = {}
+        self.remote_brawler = 0
+        self.last_network_send = 0
+
+    def reset(self):
+        self.stop_network()
         self.game_state = "menu"
+        self.player = None
+        self.opponent = None
         self.bots = []
         self.projectiles = []
         self.particles = []
         self.cubes = []
         self.kills = 0
-        self.network_error = ""
 
     def start_game(self):
+        if not 0 <= self.selected_brawler < len(BRAWLERS):
+            self.selected_brawler = 0
+        self.remote_brawler = getattr(self, "remote_brawler", 0)
+        if not 0 <= self.remote_brawler < len(BRAWLERS):
+            self.remote_brawler = 0
+        self.opponent = None
         brawler = BRAWLERS[self.selected_brawler]
         self.player = {
             "x": WORLD_W / 2,
@@ -251,10 +270,13 @@ class Brawler:
             self.opponent = self.make_opponent(self.remote_brawler)
             self.remote_input = {}
             return
+        self.opponent = None
         for _ in range(4):
             self.spawn_bot()
 
     def start_host(self):
+        if self.network is not None:
+            self.stop_network()
         connection = LanConnection()
         try:
             connection.host()
@@ -265,6 +287,7 @@ class Brawler:
         self.network = connection
         self.network_role = "host"
         self.network_status = f"Warte auf Mitspieler auf Port {LAN_PORT} ..."
+        self.network_error = ""
         self.game_state = "lobby"
 
     def start_join(self):
@@ -272,6 +295,13 @@ class Brawler:
         if not address:
             self.network_error = "Bitte die IP-Adresse des Hosts eingeben."
             return
+        try:
+            ipaddress.ip_address(address)
+        except ValueError:
+            self.network_error = "Bitte eine gueltige IPv4- oder IPv6-Adresse eingeben."
+            return
+        if self.network is not None:
+            self.stop_network()
         connection = LanConnection()
         connection.join(address)
         self.network = connection
@@ -512,7 +542,7 @@ class Brawler:
 
     def burst(self):
         player = self.player
-        if player["super"] < 100:
+        if player is None or player["super"] < 100:
             return
         player["super"] = 0
         defeated = []
@@ -531,7 +561,7 @@ class Brawler:
                     )
                 if bot["hp"] <= 0:
                     defeated.append(bot)
-        if self.network_role == "host":
+        if self.network_role == "host" and self.opponent is not None:
             opponent = self.opponent
             dx, dy = opponent["x"] - player["x"], opponent["y"] - player["y"]
             distance = math.hypot(dx, dy)
@@ -825,6 +855,17 @@ class Brawler:
                         opponent["kills"] += 1
                 self.add_burst_particles(opponent["x"], opponent["y"])
 
+    def return_to_menu(self):
+        self.stop_network()
+        self.player = None
+        self.opponent = None
+        self.bots = []
+        self.projectiles = []
+        self.particles = []
+        self.cubes = []
+        self.kills = 0
+        self.game_state = "menu"
+
     def handle_event(self, event):
         if event.type == pygame.QUIT:
             return False
@@ -833,8 +874,15 @@ class Brawler:
                 self.ip_address += event.text
             return True
         if event.type == pygame.KEYDOWN:
+            if self.game_state == "menu" and self.editing_ip and event.key == pygame.K_ESCAPE:
+                self.editing_ip = False
+                pygame.key.stop_text_input()
+                return True
             if event.key == pygame.K_ESCAPE:
-                return False
+                if self.game_state == "menu":
+                    return False
+                self.return_to_menu()
+                return True
             if event.key == pygame.K_r and self.game_state in ("won", "lost", "disconnected"):
                 if self.network_role == "client" and self.network is not None:
                     self.network.send({"type": "restart"})
@@ -850,6 +898,7 @@ class Brawler:
                     self.ip_address = self.ip_address[:-1]
                 elif self.editing_ip and event.key == pygame.K_RETURN:
                     self.editing_ip = False
+                    pygame.key.stop_text_input()
                 elif not self.editing_ip and event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
                     self.selected_brawler = event.key - pygame.K_1
                 elif not self.editing_ip and event.key in (pygame.K_LEFT, pygame.K_a):
@@ -934,83 +983,114 @@ class Brawler:
             )
 
     def draw_menu(self):
-        self.screen.fill((18, 34, 50))
-        for radius in range(330, 0, -30):
-            shade = 35 + (330 - radius) // 12
+        mouse_x, mouse_y = pygame.mouse.get_pos()
+        self.screen.fill((10, 18, 28))
+
+        glow = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        for radius in range(360, 10, -26):
+            alpha = max(18, 120 - (360 - radius) * 2)
             pygame.draw.circle(
-                self.screen, (shade // 2, shade, min(95, shade + 25)),
-                (SCREEN_W // 2, 210), radius,
+                glow,
+                (30, 97, 150, alpha),
+                (SCREEN_W // 2, 220), radius,
             )
-        for y in range(0, SCREEN_H, 48):
-            pygame.draw.line(self.screen, (22, 43, 59), (0, y), (SCREEN_W, y))
-        title = self.title_font.render("NEON BRAWL", True, (237, 248, 255))
-        subtitle = self.font.render("DREI HELDEN. EINE ARENA. WIE LANGE UEBERLEBST DU?", True, (157, 195, 218))
-        self.screen.blit(title, title.get_rect(center=(SCREEN_W // 2, 105)))
-        self.screen.blit(subtitle, subtitle.get_rect(center=(SCREEN_W // 2, 166)))
+        self.screen.blit(glow, (0, 0))
+
+        for y in range(0, SCREEN_H, 52):
+            pygame.draw.line(self.screen, (20, 40, 54), (0, y), (SCREEN_W, y))
+
+        panel = pygame.Surface((SCREEN_W - 110, 635), pygame.SRCALPHA)
+        panel.fill((17, 28, 39, 160))
+        panel_rect = panel.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 18))
+        self.screen.blit(panel, panel_rect)
+        pygame.draw.rect(self.screen, (76, 112, 142), panel_rect, 1, border_radius=24)
+
+        title = self.title_font.render("NEON BRAWL", True, (239, 247, 255))
+        self.screen.blit(title, title.get_rect(center=(SCREEN_W // 2, 92)))
+
+        subtitle = self.font.render("DREI HELDEN. EINE ARENA. WIE LANGE UEBERLEBST DU?", True, (166, 204, 222))
+        self.screen.blit(subtitle, subtitle.get_rect(center=(SCREEN_W // 2, 142)))
 
         for index, brawler in enumerate(BRAWLERS):
             rect = self.character_card_rect(index)
             selected = index == self.selected_brawler
-            card_color = (40, 65, 84) if selected else (27, 47, 66)
-            pygame.draw.rect(self.screen, card_color, rect, border_radius=20)
-            border_color = brawler["color"] if selected else (55, 78, 96)
-            pygame.draw.rect(self.screen, border_color, rect, 3 if selected else 1, border_radius=20)
+            hovered = rect.collidepoint(mouse_x, mouse_y)
+            card_color = (28, 48, 67) if not selected else (39, 66, 88)
+            if hovered and not selected:
+                card_color = (35, 59, 80)
+            pygame.draw.rect(self.screen, card_color, rect, border_radius=22)
+            glow_color = brawler["color"] if selected else (72, 94, 118)
+            glow_width = 4 if selected else 2
+            pygame.draw.rect(self.screen, glow_color, rect, glow_width, border_radius=22)
+            if selected:
+                pygame.draw.rect(self.screen, (*brawler["color"], 80), rect.inflate(10, 10), 0, border_radius=25)
+
             cx = rect.centerx
-            cy = rect.y + 66 + int(math.sin(self.animation_time * 3 + index) * 5)
+            cy = rect.y + 60 + int(math.sin(self.animation_time * 3 + index) * 5)
             preview = {
                 "x": cx, "y": cy, "radius": 25, "brawler": index,
                 "color": brawler["color"], "phase": self.animation_time * 3 + index,
-                "move_phase": self.animation_time * 3 + index, "move_amount": 0.35,
+                "move_phase": self.animation_time * 3 + index, "move_amount": 0.4,
                 "flash": 0, "hurt_timer": 0, "super": 0,
             }
             self.draw_brawler(preview, 0, 0, is_player=True, menu_preview=True)
-            name = self.font.render(brawler["name"], True, (242, 247, 252))
-            desc = self.small_font.render(brawler["description"], True, (176, 199, 215))
-            self.screen.blit(name, name.get_rect(center=(cx, rect.y + 119)))
+
+            name = self.font.render(brawler["name"], True, (244, 249, 255))
+            self.screen.blit(name, name.get_rect(center=(cx, rect.y + 118)))
+            desc = self.small_font.render(brawler["description"], True, (180, 205, 220))
             self.screen.blit(desc, desc.get_rect(center=(cx, rect.y + 148)))
-            self.screen.blit(self.small_font.render("LEBEN", True, (161, 184, 200)), (rect.x + 23, rect.y + 169))
-            self.draw_bar(rect.x + 83, rect.y + 173, 122, 8, brawler["hp"] / 145, brawler["color"])
-            self.screen.blit(self.small_font.render("ANGRIFF", True, (161, 184, 200)), (rect.x + 23, rect.y + 188))
-            self.draw_bar(rect.x + 83, rect.y + 192, 122, 8, brawler["damage"] / 38, (255, 177, 96))
-            self.screen.blit(
-                self.small_font.render(str(index + 1), True, (140, 167, 186)),
-                (rect.x + 14, rect.y + 12),
-            )
+
+            self.screen.blit(self.small_font.render("LEBEN", True, (166, 192, 207)), (rect.x + 20, rect.y + 171))
+            self.draw_bar(rect.x + 86, rect.y + 175, 120, 8, brawler["hp"] / 145, brawler["color"])
+            self.screen.blit(self.small_font.render("ANGRIFF", True, (166, 192, 207)), (rect.x + 20, rect.y + 190))
+            self.draw_bar(rect.x + 86, rect.y + 194, 120, 8, brawler["damage"] / 38, (255, 194, 111))
+
+            number_surface = self.small_font.render(str(index + 1), True, (151, 180, 196))
+            self.screen.blit(number_surface, (rect.x + 16, rect.y + 14))
 
         buttons = (
-            (self.local_button_rect(), "ALLEIN SPIELEN", (78, 193, 151)),
-            (self.host_button_rect(), "LAN SPIEL HOSTEN", (86, 167, 231)),
-            (self.join_button_rect(), "LAN SPIEL BEITRETEN", (170, 126, 235)),
+            (self.local_button_rect(), "ALLEIN SPIELEN", (76, 190, 149)),
+            (self.host_button_rect(), "LAN SPIEL HOSTEN", (97, 164, 233)),
+            (self.join_button_rect(), "LAN SPIEL BEITRETEN", (170, 122, 239)),
         )
         for rect, label, color in buttons:
-            pygame.draw.rect(self.screen, (color[0] // 3, color[1] // 3, color[2] // 3), rect, border_radius=15)
-            pygame.draw.rect(self.screen, color, rect, 2, border_radius=15)
-            text = self.small_font.render(label, True, (242, 248, 252))
+            hovered = rect.collidepoint(mouse_x, mouse_y)
+            button_back = tuple(max(0, min(255, c + (20 if hovered else 0))) for c in color)
+            pygame.draw.rect(self.screen, (button_back[0] // 3, button_back[1] // 3, button_back[2] // 3), rect.move(0, 6), border_radius=16)
+            pygame.draw.rect(self.screen, button_back, rect, border_radius=16)
+            if hovered:
+                pygame.draw.rect(self.screen, (255, 255, 255), rect, 2, border_radius=16)
+            else:
+                pygame.draw.rect(self.screen, color, rect, 2, border_radius=16)
+            text = self.small_font.render(label, True, (241, 247, 254))
             self.screen.blit(text, text.get_rect(center=rect.center))
 
         field = self.ip_field_rect()
-        field_color = (54, 78, 101) if self.editing_ip else (35, 52, 70)
-        pygame.draw.rect(self.screen, field_color, field, border_radius=10)
-        pygame.draw.rect(self.screen, (109, 154, 190), field, 2, border_radius=10)
-        ip_label = self.small_font.render("HOST-IP:", True, (174, 198, 216))
-        self.screen.blit(ip_label, (field.x - 83, field.y + 10))
-        ip_text = self.font.render(self.ip_address or "IP eingeben", True, (237, 245, 251))
+        field_color = (51, 74, 96) if self.editing_ip else (31, 46, 62)
+        pygame.draw.rect(self.screen, field_color, field, border_radius=12)
+        pygame.draw.rect(self.screen, (110, 156, 192), field, 2, border_radius=12)
+        ip_label = self.small_font.render("HOST-IP:", True, (176, 204, 221))
+        self.screen.blit(ip_label, (field.x - 82, field.y + 10))
+        ip_text = self.font.render(self.ip_address or "IP eingeben", True, (238, 246, 252))
         self.screen.blit(ip_text, (field.x + 13, field.y + 7))
         if self.editing_ip and int(self.animation_time * 2) % 2 == 0:
             cursor_x = field.x + 13 + ip_text.get_width() + 2
-            pygame.draw.line(self.screen, (240, 248, 255), (cursor_x, field.y + 8), (cursor_x, field.bottom - 8), 2)
+            pygame.draw.line(self.screen, (242, 247, 255), (cursor_x, field.y + 8), (cursor_x, field.bottom - 8), 2)
+
         if self.game_state in ("lobby", "connecting"):
             status = self.network_status
             if self.network_role == "host":
                 status = f"{self.network_status}  (IP: {self.get_local_ip()})"
-            status_surface = self.small_font.render(status, True, (255, 221, 137))
+            status_surface = self.small_font.render(status, True, (255, 219, 138))
             self.screen.blit(status_surface, status_surface.get_rect(center=(SCREEN_W // 2, 663)))
         elif self.network_error:
-            error_surface = self.small_font.render(self.network_error[:90], True, (255, 132, 142))
+            error_surface = self.small_font.render(self.network_error[:90], True, (255, 135, 143))
             self.screen.blit(error_surface, error_surface.get_rect(center=(SCREEN_W // 2, 663)))
         else:
             controls = self.small_font.render(
-                "WASD: Bewegen   Maus: Zielen & Schiessen   SPACE: Dash / Super", True, (160, 188, 205)
+                "WASD: Bewegen   Maus: Zielen & Schiessen   SPACE: Dash / Super",
+                True,
+                (160, 189, 205),
             )
             self.screen.blit(controls, controls.get_rect(center=(SCREEN_W // 2, 663)))
         pygame.display.flip()
@@ -1237,7 +1317,7 @@ class Brawler:
             subtitle = "Du hast die Arena gemeistert." if self.game_state == "won" else "Die Bots waren staerker."
             title_surface = self.title_font.render(title, True, (237, 247, 255))
             sub_surface = self.font.render(subtitle, True, (181, 201, 216))
-            restart = self.small_font.render("R: Nochmal spielen     ESC: Beenden", True, (134, 202, 234))
+            restart = self.small_font.render("R: Nochmal spielen     ESC: Zurueck ins Menü", True, (134, 202, 234))
             self.screen.blit(title_surface, title_surface.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 46)))
             self.screen.blit(sub_surface, sub_surface.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 4)))
             self.screen.blit(restart, restart.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 48)))
@@ -1304,114 +1384,6 @@ class Brawler:
         pygame.draw.circle(self.screen, eye_color, (sx + 6, sy - 4), 3)
         pygame.draw.arc(self.screen, eye_color, (sx - 6, sy, 12, 9), 3.4, 5.9, 2)
 
-    def draw_power_cube_legacy(self, cube, camera_x, camera_y):
-        x = int(cube["x"] - camera_x)
-        y = int(cube["y"] - camera_y + math.sin(cube["phase"]) * 5)
-        if not (-30 < x < SCREEN_W + 30 and -30 < y < SCREEN_H + 30):
-            return
-        rotation = cube["phase"]
-        size = 12
-        points = []
-        for index in range(4):
-            angle = rotation + math.pi / 4 + index * math.pi / 2
-            points.append((x + int(math.cos(angle) * size), y + int(math.sin(angle) * size)))
-        pygame.draw.circle(self.screen, (57, 155, 83), (x, y), 19)
-        pygame.draw.polygon(self.screen, (117, 255, 139), points)
-        pygame.draw.polygon(self.screen, (233, 255, 208), points, 2)
-        pygame.draw.circle(self.screen, (255, 255, 255), (x - 3, y - 4), 2)
-
-    def draw_legacy(self):
-        if self.game_state == "menu":
-            self.draw_menu()
-            return
-        camera_x, camera_y = self.player_screen_pos()
-        self.screen.fill((27, 51, 58))
-        grid = 48
-        for x in range(-int(camera_x) % grid, SCREEN_W, grid):
-            pygame.draw.line(self.screen, (31, 57, 63), (x, 0), (x, SCREEN_H))
-        for y in range(-int(camera_y) % grid, SCREEN_H, grid):
-            pygame.draw.line(self.screen, (31, 57, 63), (0, y), (SCREEN_W, y))
-
-        for index in range(32):
-            world_x = (index * 263 + 117) % WORLD_W
-            world_y = (index * 397 + 83) % WORLD_H
-            sx, sy = int(world_x - camera_x), int(world_y - camera_y)
-            if 0 <= sx < SCREEN_W and 0 <= sy < SCREEN_H:
-                pygame.draw.circle(self.screen, (43, 78, 71), (sx, sy), 4)
-                pygame.draw.circle(self.screen, (58, 104, 84), (sx - 3, sy - 2), 2)
-
-        for wall in WALLS:
-            rect = pygame.Rect(wall.x - camera_x, wall.y - camera_y, wall.width, wall.height)
-            if rect.colliderect(self.screen.get_rect()):
-                pygame.draw.rect(self.screen, (16, 31, 42), rect.move(0, 7), border_radius=12)
-                pygame.draw.rect(self.screen, (67, 91, 94), rect, border_radius=12)
-                pygame.draw.rect(self.screen, (89, 119, 116), rect, width=3, border_radius=12)
-                for mark_x in range(rect.x + 18, rect.right - 8, 34):
-                    pygame.draw.line(self.screen, (78, 103, 103), (mark_x, rect.y + 8), (mark_x + 9, rect.y + 15), 2)
-
-        for particle in self.particles:
-            pygame.draw.circle(
-                self.screen, particle["color"],
-                (int(particle["x"] - camera_x), int(particle["y"] - camera_y)),
-                max(2, int(5 * particle["life"] * 2)),
-            )
-
-        for projectile in self.projectiles:
-            point = (int(projectile["x"] - camera_x), int(projectile["y"] - camera_y))
-            if len(projectile["trail"]) > 1:
-                trail_points = [
-                    (int(x - camera_x), int(y - camera_y))
-                    for x, y in projectile["trail"]
-                ]
-                pygame.draw.lines(self.screen, projectile["color"], False, trail_points + [point], 3)
-            pygame.draw.circle(self.screen, projectile["color"], point, projectile["radius"] + 3)
-            pygame.draw.circle(self.screen, (255, 255, 255), point, projectile["radius"] // 2 + 1)
-
-        for cube in self.cubes:
-            self.draw_power_cube(cube, camera_x, camera_y)
-
-        for bot in self.bots:
-            x, y = int(bot["x"] - camera_x), int(bot["y"] - camera_y)
-            if -40 < x < SCREEN_W + 40 and -40 < y < SCREEN_H + 40:
-                self.draw_bar(x - 22, y - 29, 44, 6, bot["hp"] / bot["max_hp"], (255, 93, 103))
-                self.draw_brawler(bot, camera_x, camera_y)
-
-        player = self.player
-        px, py = int(player["x"] - camera_x), int(player["y"] - camera_y)
-        self.draw_brawler(player, camera_x, camera_y, is_player=True)
-
-        pygame.draw.rect(self.screen, (17, 25, 39), (20, 17, 330, 82), border_radius=15)
-        self.screen.blit(self.font.render(BRAWLERS[player["brawler"]]["name"], True, (229, 246, 255)), (36, 27))
-        self.draw_bar(37, 64, 170, 13, player["hp"] / player["max_hp"], (76, 224, 143))
-        self.screen.blit(self.small_font.render(f"{int(player['hp'])} HP", True, (223, 239, 241)), (217, 60))
-        self.screen.blit(self.small_font.render(f"ELIMS  {self.kills}/10", True, (206, 224, 230)), (38, 81))
-        cube_label = self.small_font.render(f"POWER CUBES  x{player['cubes']}", True, (162, 255, 174))
-        self.screen.blit(cube_label, (370, 31))
-
-        super_x, super_y = SCREEN_W - 210, SCREEN_H - 40
-        self.screen.blit(self.small_font.render("SUPER [SPACE]", True, (218, 233, 243)), (super_x, super_y - 23))
-        super_color = (255, 202, 75) if player["super"] >= 100 else (102, 197, 246)
-        self.draw_bar(super_x, super_y, 176, 13, player["super"] / 100, super_color, (40, 49, 62))
-        if player["super"] >= 100:
-            pygame.draw.circle(self.screen, (255, 217, 90), (super_x + 190, super_y + 6), 7)
-
-        help_text = "WASD bewegen  |  Maus zielen & halten: schiessen  |  SPACE: Dash / Super"
-        help_surface = self.small_font.render(help_text, True, (208, 224, 230))
-        self.screen.blit(help_surface, help_surface.get_rect(center=(SCREEN_W // 2, SCREEN_H - 19)))
-
-        if self.game_state != "playing":
-            overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-            overlay.fill((9, 15, 25, 205))
-            self.screen.blit(overlay, (0, 0))
-            title = "SIEG!" if self.game_state == "won" else "AUSGESCHALTET"
-            subtitle = "Du hast die Arena gemeistert." if self.game_state == "won" else "Die Bots waren staerker."
-            title_surface = self.title_font.render(title, True, (237, 247, 255))
-            sub_surface = self.font.render(subtitle, True, (181, 201, 216))
-            restart = self.small_font.render("R: Nochmal spielen     ESC: Beenden", True, (134, 202, 234))
-            self.screen.blit(title_surface, title_surface.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 46)))
-            self.screen.blit(sub_surface, sub_surface.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 4)))
-            self.screen.blit(restart, restart.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 48)))
-        pygame.display.flip()
 
     def run(self):
         running = True
