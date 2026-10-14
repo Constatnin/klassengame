@@ -1,13 +1,15 @@
 # Klassengame / Neon Arena
 
 Ein lokales 2D-Arena-Spiel mit Pygame. Du kannst solo gegen Bots kämpfen oder
-mit einer zweiten Person im selben WLAN über LAN duellieren.
+mit bis zu vier weiteren Personen im selben WLAN im LAN gegeneinander antreten.
 
 ## Überblick
 
-- 3 spielbare Brawler mit unterschiedlicher Geschwindigkeit, Health und Damage
+- 5 spielbare Brawler mit unterschiedlicher Geschwindigkeit, Health und Damage
 - Einzelspieler gegen KI-Bots
-- Mehrspieler-Modus über TCP im lokalen Netzwerk
+- LAN-Mehrspieler für bis zu 5 Personen (Host plus vier Mitspieler)
+- Erweiterte Arena mit größeren Wegen und neuen Kampfbereichen
+- Freie Fenstergröße und umschaltbarer Vollbildmodus
 - Power Cubes, Super-Attacken, Dash und Gegner-Spawn-System
 - Einfache, feste Steuerung ohne externe Abhängigkeiten außer Pygame
 
@@ -54,13 +56,17 @@ py main.py
 ### LAN-Multiplayer
 
 1. Ein Spieler startet als Host (`LAN SPIEL HOSTEN`).
-2. Der Host teilt die im Menü angezeigte lokale IP-Adresse mit.
-3. Der zweite Spieler gibt diese IP in `HOST-IP` ein und klickt auf
+2. Der Host teilt die im Menü angezeigte IPv4-Adresse mit.
+3. Der zweite Spieler klickt auf `HOST-IP`, gibt die IPv4-Adresse ein und klickt auf
    `LAN SPIEL BEITRETEN`.
-4. Sobald beide verbunden sind, beginnt das Match.
+4. Bis zu vier Mitspieler können nacheinander beitreten; das Match beginnt mit
+   dem ersten Mitspieler. Weitere Mitspieler können auch während des Matches
+   dazukommen.
 
-Hinweis: Die Verbindung nutzt TCP-Port `50505`. Der Host muss möglicherweise die
-Windows-Firewall für private Netzwerke erlauben.
+Beide Geräte müssen im selben lokalen Netzwerk sein. `127.0.0.1` funktioniert
+nur, wenn Host und Client auf demselben Rechner laufen. Die Verbindung nutzt
+TCP-Port `50505`; der Host muss Python gegebenenfalls in der Windows-Firewall
+für private Netzwerke zulassen.
 
 ## Steuerung
 
@@ -70,9 +76,10 @@ Windows-Firewall für private Netzwerke erlauben.
 | Pfeiltasten | Alternative Bewegung |
 | Linke Maustaste gedrückt halten | Zielen und Schießen |
 | `Leertaste` | Dash / Super-Attacke |
-| `Esc` | Spiel beenden |
+| `Esc` | Zurück ins Menü; im Menü beendet es das Spiel |
+| `F11` | Vollbild ein-/ausschalten |
 | `R` | Nach dem Sieg oder Verlust neu starten |
-| `1`, `2`, `3` | Brawler im Menü auswählen |
+| `1` bis `5` | Brawler im Menü auswählen |
 | `Enter` | Im Menü starten |
 
 ## Brawler
@@ -80,6 +87,22 @@ Windows-Firewall für private Netzwerke erlauben.
 - `NOVA`: ausgewogen, stabiler Energieschuss
 - `VOLT`: schnell, hohe Feuerrate, agiler Bewegungsstil
 - `BRUTUS`: langsam aber robust mit starkem Schaden
+- `LYNX`: wendig und präzise
+- `ORBIT`: ausgewogen mit starkem Plasmaschuss
+
+Jeder Brawler hat eine eigene Superkraft. Die geladene Superkraft wird mit
+`Leertaste` aktiviert; wenn die Superanzeige noch nicht voll ist, löst die Taste
+stattdessen den Dash aus.
+
+- `NOVA` – Nova-Impuls: trifft Gegner im Umkreis
+- `VOLT` – Blitzsalve: feuert fünf schnelle Schüsse nach vorn
+- `BRUTUS` – Bodenbrecher: hoher Schaden in einem großen Nahbereich
+- `LYNX` – Phasensprung: stürmt vor und rammt Gegner am Zielpunkt
+- `ORBIT` – Gravitationsfeld: zieht nahe Gegner heran und verletzt sie
+
+Das Spielfenster lässt sich an den Rändern größer oder kleiner ziehen. Mit
+`F11` wechselst du zwischen Fenster- und Vollbildmodus; die zuletzt genutzte
+Fenstergröße bleibt beim Zurückwechseln erhalten.
 
 ## Power Cubes
 
@@ -95,7 +118,8 @@ laden außerdem die Superanzeige auf.
 
 ## Verifikation
 
-Das Projekt wurde mit einem kurzen Smoke-Test geprüft:
+Das Projekt wurde mit Syntax- und headless Smoke-Tests für Menü, Vollbild, Brawler
+und einen lokalen Fünf-Spieler-LAN-Ablauf geprüft:
 
 ```powershell
 python -m py_compile main.py

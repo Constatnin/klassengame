@@ -12,8 +12,10 @@ import pygame
 
 
 SCREEN_W, SCREEN_H = 960, 680
-WORLD_W, WORLD_H = 1800, 1300
+WORLD_W, WORLD_H = 2200, 1600
 LAN_PORT = 50505
+MAX_PLAYERS = 5
+MAX_CLIENTS = MAX_PLAYERS - 1
 PLAYER_SPEED = 270
 BOT_COLORS = ((255, 104, 112), (255, 170, 70), (195, 118, 255), (255, 215, 85))
 BRAWLERS = (
@@ -26,6 +28,8 @@ BRAWLERS = (
         "fire_rate": 0.24,
         "bullet_speed": 660,
         "description": "Ausgewogen - schneller Energieschuss",
+        "super_name": "Nova-Impuls",
+        "super_description": "Impulswelle: trifft Gegner in der Naehe",
     },
     {
         "name": "VOLT",
@@ -36,6 +40,8 @@ BRAWLERS = (
         "fire_rate": 0.15,
         "bullet_speed": 730,
         "description": "Flink - schnelle Doppelschuesse",
+        "super_name": "Blitzsalve",
+        "super_description": "Salve: fuenf schnelle Schuesse nach vorn",
     },
     {
         "name": "BRUTUS",
@@ -46,6 +52,32 @@ BRAWLERS = (
         "fire_rate": 0.48,
         "bullet_speed": 540,
         "description": "Tank - langsam, aber maechtig",
+        "super_name": "Bodenbrecher",
+        "super_description": "Schmetterschlag: hoher Nahbereichsschaden",
+    },
+    {
+        "name": "LYNX",
+        "color": (94, 224, 167),
+        "hp": 90,
+        "speed": 300,
+        "damage": 20,
+        "fire_rate": 0.22,
+        "bullet_speed": 690,
+        "description": "Wendig - praezise Energiesalven",
+        "super_name": "Phasensprung",
+        "super_description": "Sprung: stuerme vor und ramme Gegner",
+    },
+    {
+        "name": "ORBIT",
+        "color": (181, 139, 255),
+        "hp": 115,
+        "speed": 245,
+        "damage": 29,
+        "fire_rate": 0.36,
+        "bullet_speed": 610,
+        "description": "Kontrolle - starke Plasmakugeln",
+        "super_name": "Gravitationsfeld",
+        "super_description": "Sog: zieht nahe Gegner heran und verletzt sie",
     },
 )
 
@@ -62,6 +94,14 @@ WALLS = (
     pygame.Rect(1320, 1010, 66, 190),
     pygame.Rect(80, 900, 210, 60),
     pygame.Rect(1560, 770, 170, 60),
+    pygame.Rect(1820, 180, 70, 270),
+    pygame.Rect(1760, 560, 290, 58),
+    pygame.Rect(1900, 880, 70, 290),
+    pygame.Rect(1520, 1240, 310, 58),
+    pygame.Rect(1050, 1330, 70, 190),
+    pygame.Rect(480, 1230, 260, 58),
+    pygame.Rect(340, 1080, 64, 190),
+    pygame.Rect(780, 360, 250, 52),
 )
 
 
@@ -90,6 +130,9 @@ class LanConnection:
         self.messages = queue.Queue()
         self.connection = None
         self.listener = None
+        self.connections = {}
+        self.connection_lock = threading.Lock()
+        self.next_peer_id = 1
         self.send_lock = threading.Lock()
         self.closed = False
 
@@ -97,7 +140,7 @@ class LanConnection:
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.listener.bind(("", LAN_PORT))
-        self.listener.listen(1)
+        self.listener.listen(MAX_CLIENTS)
         self.listener.settimeout(0.5)
         threading.Thread(target=self._accept, daemon=True).start()
 
@@ -112,10 +155,19 @@ class LanConnection:
                     self.messages.put({"type": "error", "message": str(error)})
                 return
             connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.connection = connection
-            self.messages.put({"type": "connected", "address": address[0]})
-            threading.Thread(target=self._receive, args=(connection,), daemon=True).start()
-            return
+            with self.connection_lock:
+                if len(self.connections) >= MAX_CLIENTS:
+                    peer_id = None
+                else:
+                    peer_id = f"client_{self.next_peer_id}"
+                    self.next_peer_id += 1
+                    self.connections[peer_id] = connection
+            if peer_id is None:
+                self._send_socket(connection, {"type": "error", "message": "Der Host ist bereits voll (maximal 5 Spieler)."})
+                connection.close()
+                continue
+            self.messages.put({"type": "connected", "address": address[0], "peer_id": peer_id})
+            threading.Thread(target=self._receive, args=(connection, peer_id), daemon=True).start()
 
     def join(self, address):
         def connect():
@@ -126,14 +178,14 @@ class LanConnection:
                 connection.settimeout(None)
                 connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.connection = connection
-                self.messages.put({"type": "connected", "address": address})
-                threading.Thread(target=self._receive, args=(connection,), daemon=True).start()
+                self.messages.put({"type": "connected", "address": address, "peer_id": None})
+                threading.Thread(target=self._receive, args=(connection, None), daemon=True).start()
             except OSError as error:
                 connection.close()
                 self.messages.put({"type": "error", "message": str(error)})
         threading.Thread(target=connect, daemon=True).start()
 
-    def _receive(self, connection):
+    def _receive(self, connection, peer_id):
         buffer = b""
         try:
             while not self.closed:
@@ -143,16 +195,22 @@ class LanConnection:
                 buffer += data
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
-                    self.messages.put(json.loads(line.decode("utf-8")))
+                    message = json.loads(line.decode("utf-8"))
+                    if peer_id is not None:
+                        message["peer_id"] = peer_id
+                    self.messages.put(message)
         except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
             if not self.closed:
-                self.messages.put({"type": "error", "message": str(error)})
+                self.messages.put({"type": "error", "message": str(error), "peer_id": peer_id})
         finally:
             if not self.closed:
-                self.messages.put({"type": "disconnected"})
+                self.messages.put({"type": "disconnected", "peer_id": peer_id})
+            if peer_id is not None:
+                with self.connection_lock:
+                    if self.connections.get(peer_id) is connection:
+                        self.connections.pop(peer_id, None)
 
-    def send(self, message):
-        connection = self.connection
+    def _send_socket(self, connection, message, peer_id=None):
         if connection is None:
             return
         payload = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
@@ -160,11 +218,39 @@ class LanConnection:
             with self.send_lock:
                 connection.sendall(payload)
         except OSError as error:
-            self.messages.put({"type": "error", "message": str(error)})
+            if not self.closed:
+                self.messages.put({"type": "error", "message": str(error), "peer_id": peer_id})
+
+    def send(self, message, peer_id=None):
+        if self.listener is None:
+            self._send_socket(self.connection, message)
+            return
+        if peer_id is None:
+            with self.connection_lock:
+                connections = list(self.connections.items())
+            for connected_peer, connection in connections:
+                self._send_socket(connection, message, connected_peer)
+            return
+        with self.connection_lock:
+            connection = self.connections.get(peer_id)
+        self._send_socket(connection, message, peer_id)
+
+    def close_peer(self, peer_id):
+        with self.connection_lock:
+            connection = self.connections.pop(peer_id, None)
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
 
     def close(self):
         self.closed = True
-        for connection in (self.connection, self.listener):
+        with self.connection_lock:
+            connections = list(self.connections.values())
+            self.connections.clear()
+        for connection in connections + [self.connection, self.listener]:
             if connection is not None:
                 try:
                     connection.shutdown(socket.SHUT_RDWR)
@@ -177,7 +263,10 @@ class Brawler:
     def __init__(self):
         pygame.init()
         pygame.display.set_caption("Neon Arena")
-        self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+        self.window = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.RESIZABLE)
+        self.screen = pygame.Surface((SCREEN_W, SCREEN_H))
+        self.fullscreen = False
+        self.windowed_size = (SCREEN_W, SCREEN_H)
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 29)
         self.small_font = pygame.font.Font(None, 22)
@@ -190,12 +279,14 @@ class Brawler:
         self.network_error = ""
         self.ip_address = "127.0.0.1"
         self.editing_ip = False
+        self.ip_input_selected = False
         self.last_network_send = 0
         self.remote_input = {}
         self.remote_dash_cooldown = 0
+        self.remote_players = {}
+        self.client_id = None
+        self.winner_id = None
         self.player = None
-        self.opponent = None
-        self.remote_brawler = 0
         self.reset()
 
     def stop_network(self):
@@ -206,14 +297,14 @@ class Brawler:
         self.network_status = ""
         self.network_error = ""
         self.remote_input = {}
-        self.remote_brawler = 0
+        self.remote_players = {}
+        self.client_id = None
         self.last_network_send = 0
 
     def reset(self):
         self.stop_network()
         self.game_state = "menu"
         self.player = None
-        self.opponent = None
         self.bots = []
         self.projectiles = []
         self.particles = []
@@ -223,12 +314,61 @@ class Brawler:
     def start_game(self):
         if not 0 <= self.selected_brawler < len(BRAWLERS):
             self.selected_brawler = 0
-        self.remote_brawler = getattr(self, "remote_brawler", 0)
-        if not 0 <= self.remote_brawler < len(BRAWLERS):
-            self.remote_brawler = 0
-        self.opponent = None
-        brawler = BRAWLERS[self.selected_brawler]
-        self.player = {
+        connected_players = {}
+        if self.network_role == "host":
+            connected_players = {
+                player_id: fighter["brawler"]
+                for player_id, fighter in self.remote_players.items()
+            }
+        self.winner_id = None
+        self.player = self.make_fighter(self.selected_brawler, "host")
+        self.player["x"], self.player["y"] = self.player_spawn(0)
+        self.remote_players = {}
+        for position, (player_id, brawler_index) in enumerate(connected_players.items(), 1):
+            fighter = self.make_fighter(brawler_index, player_id)
+            fighter["spawn_slot"] = position
+            fighter["x"], fighter["y"] = self.player_spawn(position)
+            self.remote_players[player_id] = fighter
+        if self.network_role == "client":
+            self.player = self.make_fighter(self.selected_brawler, self.client_id or "client")
+        self.bots = []
+        self.projectiles = []
+        self.particles = []
+        self.cubes = []
+        self.kills = 0
+        self.spawn_timer = 0
+        self.game_state = "playing"
+        self.state_send_timer = 0
+        self.dash_pending = False
+        self.super_pending = False
+        if self.network_role == "host":
+            self.remote_input = {}
+            self.cubes = []
+            for x, y in (
+                (650, 410), (1150, 390), (430, 720), (1370, 820),
+                (830, 1040), (1530, 570), (1850, 650), (500, 1380),
+            ):
+                self.spawn_cube(x, y)
+            return
+        if self.network_role == "client":
+            self.remote_input = {}
+            return
+        self.remote_players = {}
+        for _ in range(4):
+            self.spawn_bot()
+
+    @staticmethod
+    def player_spawn(index):
+        center_x, center_y = WORLD_W / 2, WORLD_H / 2
+        if index == 0:
+            return center_x, center_y
+        angle = -math.pi / 2 + (index - 1) * math.tau / MAX_CLIENTS
+        return center_x + math.cos(angle) * 300, center_y + math.sin(angle) * 300
+
+    @staticmethod
+    def make_fighter(brawler_index, player_id):
+        brawler = BRAWLERS[brawler_index]
+        return {
             "x": WORLD_W / 2,
             "y": WORLD_H / 2,
             "hp": brawler["hp"],
@@ -243,36 +383,13 @@ class Brawler:
             "move_phase": 0,
             "move_amount": 0,
             "flash": 0,
-            "brawler": self.selected_brawler,
+            "brawler": brawler_index,
             "cubes": 0,
             "kills": 0,
+            "color": brawler["color"],
+            "player_id": player_id,
+            "spawn_slot": 0,
         }
-        self.bots = []
-        self.projectiles = []
-        self.particles = []
-        self.cubes = []
-        self.kills = 0
-        self.spawn_timer = 0
-        self.game_state = "playing"
-        self.state_send_timer = 0
-        self.dash_pending = False
-        self.super_pending = False
-        if self.network_role == "host":
-            self.bots.clear()
-            self.opponent = self.make_opponent(self.remote_brawler)
-            self.remote_input = {}
-            self.cubes = []
-            for x, y in ((650, 410), (1150, 390), (430, 720), (1370, 820), (830, 1040), (1530, 570)):
-                self.spawn_cube(x, y)
-            return
-        if self.network_role == "client":
-            self.bots.clear()
-            self.opponent = self.make_opponent(self.remote_brawler)
-            self.remote_input = {}
-            return
-        self.opponent = None
-        for _ in range(4):
-            self.spawn_bot()
 
     def start_host(self):
         if self.network is not None:
@@ -296,9 +413,12 @@ class Brawler:
             self.network_error = "Bitte die IP-Adresse des Hosts eingeben."
             return
         try:
-            ipaddress.ip_address(address)
+            parsed_address = ipaddress.ip_address(address)
         except ValueError:
-            self.network_error = "Bitte eine gueltige IPv4- oder IPv6-Adresse eingeben."
+            self.network_error = "Bitte eine gueltige IPv4-Adresse eingeben."
+            return
+        if parsed_address.version != 4:
+            self.network_error = "Der LAN-Host erwartet eine IPv4-Adresse."
             return
         if self.network is not None:
             self.stop_network()
@@ -320,47 +440,98 @@ class Brawler:
             except queue.Empty:
                 break
             kind = message.get("type")
+            peer_id = message.get("peer_id")
             if kind == "connected":
-                self.network_status = f"Verbunden mit {message.get('address', 'Mitspieler')}"
-                self.network.send({
-                    "type": "hello",
-                    "brawler": self.selected_brawler,
-                })
+                if self.network_role == "client":
+                    self.network_status = f"Verbunden mit {message.get('address', 'Host')}"
+                    connection.send({
+                        "type": "hello",
+                        "brawler": self.selected_brawler,
+                    })
+                else:
+                    self.network_status = f"{len(self.remote_players)} von {MAX_CLIENTS} Mitspielern verbunden"
             elif kind == "hello":
                 brawler = message.get("brawler")
+                if self.network_role != "host" or peer_id is None:
+                    continue
                 if not isinstance(brawler, int) or not 0 <= brawler < len(BRAWLERS):
-                    self.network_error = "Der Mitspieler hat einen ungueltigen Brawler gesendet."
-                    self.network.close()
-                    self.network = None
-                    self.network_role = None
-                    self.game_state = "menu"
-                    break
-                self.remote_brawler = brawler
-                self.network_status = f"Gegner: {BRAWLERS[brawler]['name']}"
-                if self.network_role == "host":
-                    self.start_game()
-                elif self.network_role == "client":
-                    self.start_game()
+                    connection.send({"type": "error", "message": "Ungueltiger Brawler."}, peer_id)
+                    connection.close_peer(peer_id)
+                    continue
+                if peer_id not in self.remote_players:
+                    if len(self.remote_players) >= MAX_CLIENTS:
+                        connection.send({"type": "error", "message": "Der Host ist bereits voll."}, peer_id)
+                        connection.close_peer(peer_id)
+                        continue
+                    fighter = self.make_fighter(brawler, peer_id)
+                    occupied_slots = {
+                        existing.get("spawn_slot", 0)
+                        for existing in self.remote_players.values()
+                    }
+                    spawn_slot = next(slot for slot in range(1, MAX_PLAYERS) if slot not in occupied_slots)
+                    fighter["spawn_slot"] = spawn_slot
+                    fighter["x"], fighter["y"] = self.player_spawn(spawn_slot)
+                    self.remote_players[peer_id] = fighter
+                    self.remote_input[peer_id] = {}
+                    if self.game_state in ("lobby", "won", "lost"):
+                        self.start_game()
+                    self.network_status = f"{len(self.remote_players)} von {MAX_CLIENTS} Mitspielern verbunden"
+                connection.send({
+                    "type": "welcome",
+                    "client_id": peer_id,
+                    "players": len(self.remote_players) + 1,
+                }, peer_id)
+                self.send_network_state(0, force=True)
             elif kind == "input" and self.network_role == "host":
-                self.remote_input = message
+                if peer_id in self.remote_players:
+                    self.remote_input[peer_id] = message
             elif kind == "restart" and self.network_role == "host":
                 self.start_game()
+            elif kind == "welcome" and self.network_role == "client":
+                client_id = message.get("client_id")
+                if not isinstance(client_id, str) or not client_id.startswith("client_"):
+                    self.handle_network_failure("Ungueltige Spieler-ID vom Host.", connection)
+                    break
+                self.client_id = client_id
+                self.start_game()
+                self.network_status = f"Verbunden: {message.get('players', 2)} Spieler"
             elif kind == "state" and self.network_role == "client":
                 self.apply_network_state(message)
             elif kind == "error":
-                self.network_error = f"Netzwerkfehler: {message.get('message', 'Unbekannter Fehler')}"
-                if self.game_state in ("connecting", "lobby"):
-                    connection.close()
-                    self.network = None
-                    self.network_role = None
-                    self.game_state = "menu"
-                self.network_status = self.network_error
+                if self.network_role == "host" and peer_id is not None:
+                    connection.close_peer(peer_id)
+                    self.remote_players.pop(peer_id, None)
+                    self.remote_input.pop(peer_id, None)
+                    self.network_status = str(message.get("message", "Mitspieler getrennt"))
+                    continue
+                self.handle_network_failure(
+                    f"Netzwerkfehler: {message.get('message', 'Unbekannter Fehler')}",
+                    connection,
+                )
                 break
             elif kind == "disconnected":
-                self.network_status = "Verbindung zum Mitspieler verloren."
-                self.network_error = self.network_status
-                if self.game_state == "playing":
-                    self.game_state = "disconnected"
+                if self.network_role == "host" and peer_id is not None:
+                    self.remote_players.pop(peer_id, None)
+                    self.remote_input.pop(peer_id, None)
+                    self.network_status = f"{len(self.remote_players)} von {MAX_CLIENTS} Mitspielern verbunden"
+                    continue
+                self.handle_network_failure(
+                    "Verbindung zum Mitspieler verloren.",
+                    connection,
+                )
+                break
+
+    def handle_network_failure(self, status, connection):
+        connection.close()
+        if self.network is connection:
+            self.network = None
+        self.network_status = status
+        self.network_error = status
+        if self.game_state in ("connecting", "lobby"):
+            self.network_role = None
+            self.game_state = "menu"
+        elif self.game_state in ("playing", "won", "lost"):
+            self.game_state = "disconnected"
 
     def collect_network_input(self):
         keys = pygame.key.get_pressed()
@@ -372,7 +543,7 @@ class Brawler:
         return {
             "type": "input",
             "move": [mx, my],
-            "aim": list(self.screen_to_world(pygame.mouse.get_pos())),
+            "aim": list(self.screen_to_world(self.logical_mouse_pos())),
             "fire": bool(pygame.mouse.get_pressed()[0]),
             "dash": self.dash_pending,
             "super": self.super_pending,
@@ -389,16 +560,21 @@ class Brawler:
         self.super_pending = False
 
     def send_network_state(self, dt, force=False):
-        if self.network_role != "host" or self.network is None or self.game_state not in ("playing", "won", "lost"):
+        if self.network_role != "host" or self.network is None:
             return
         self.state_send_timer += dt
         if self.state_send_timer < 1 / 20 and not force:
             return
         self.state_send_timer = 0
-        self.network.send({
+        state = {
             "type": "state",
-            "player": self.serialize_fighter(self.player),
-            "opponent": self.serialize_fighter(self.opponent),
+            "players": {
+                "host": self.serialize_fighter(self.player),
+                **{
+                    player_id: self.serialize_fighter(fighter)
+                    for player_id, fighter in self.remote_players.items()
+                },
+            },
             "cubes": [[cube["x"], cube["y"], cube["phase"]] for cube in self.cubes],
             "projectiles": [
                 [p["x"], p["y"], p["vx"], p["vy"], p["owner"], p["color"]]
@@ -406,7 +582,10 @@ class Brawler:
             ],
             "kills": self.kills,
             "game_state": self.game_state,
-        })
+            "winner_id": self.winner_id,
+        }
+        for player_id in self.remote_players:
+            self.network.send(state, player_id)
 
     @staticmethod
     def serialize_fighter(fighter):
@@ -416,14 +595,34 @@ class Brawler:
         }
 
     def apply_network_state(self, message):
-        host_player = message.get("player")
-        host_opponent = message.get("opponent")
-        if not isinstance(host_player, dict) or not isinstance(host_opponent, dict):
+        players = message.get("players")
+        if not isinstance(players, dict) or self.client_id not in players or "host" not in players:
             self.network_error = "Ungueltige Spieldaten vom Host empfangen."
             return
-        for key, value in host_opponent.items():
-            self.player[key] = value
-        self.opponent.update(host_player)
+        for player_id, state in players.items():
+            if not isinstance(state, dict):
+                self.network_error = "Ungueltige Spielerdaten vom Host empfangen."
+                return
+            brawler_index = state.get("brawler")
+            if not isinstance(brawler_index, int) or not 0 <= brawler_index < len(BRAWLERS):
+                self.network_error = "Ungueltiger Brawler in den Spieldaten."
+                return
+            if player_id == self.client_id:
+                fighter = self.player or self.make_fighter(brawler_index, player_id)
+                self.player = fighter
+            else:
+                fighter = self.remote_players.get(player_id)
+                if fighter is None:
+                    fighter = self.make_fighter(brawler_index, player_id)
+                    self.remote_players[player_id] = fighter
+            fighter.update(state)
+            fighter["color"] = BRAWLERS[brawler_index]["color"]
+        self.remote_players = {
+            player_id: fighter
+            for player_id, fighter in self.remote_players.items()
+            if player_id in players and player_id != self.client_id
+        }
+        self.network_error = ""
         self.cubes = [
             {"x": item[0], "y": item[1], "phase": item[2], "pickup": 0}
             for item in message.get("cubes", [])
@@ -438,33 +637,12 @@ class Brawler:
             for item in message.get("projectiles", [])
             if isinstance(item, list) and len(item) == 6
         ]
-        self.kills = host_opponent.get("kills", 0)
-        host_state = message.get("game_state", "playing")
-        self.game_state = {"won": "lost", "lost": "won"}.get(host_state, host_state)
-
-    @staticmethod
-    def make_opponent(brawler_index):
-        brawler = BRAWLERS[brawler_index]
-        return {
-            "x": WORLD_W / 2 + 150,
-            "y": WORLD_H / 2,
-            "hp": brawler["hp"],
-            "max_hp": brawler["hp"],
-            "radius": 19,
-            "cooldown": 0,
-            "hurt_timer": 0,
-            "flash": 0,
-            "super": 0,
-            "dash_timer": 0,
-            "dash_dir": (0, 0),
-            "dash_cooldown": 0,
-            "move_phase": 0,
-            "move_amount": 0,
-            "brawler": brawler_index,
-            "cubes": 0,
-            "kills": 0,
-            "color": brawler["color"],
-        }
+        self.kills = self.player.get("kills", 0)
+        self.winner_id = message.get("winner_id")
+        if message.get("game_state") == "playing":
+            self.game_state = "playing"
+        else:
+            self.game_state = "won" if self.winner_id == self.client_id else "lost"
 
     def spawn_bot(self):
         for _ in range(50):
@@ -493,6 +671,43 @@ class Brawler:
         camera_x = max(0, min(WORLD_W - SCREEN_W, self.player["x"] - SCREEN_W / 2))
         camera_y = max(0, min(WORLD_H - SCREEN_H, self.player["y"] - SCREEN_H / 2))
         return camera_x, camera_y
+
+    def logical_mouse_pos(self, position=None):
+        if position is None:
+            position = pygame.mouse.get_pos()
+        window_width, window_height = self.window.get_size()
+        scale = min(window_width / SCREEN_W, window_height / SCREEN_H)
+        rendered_width, rendered_height = int(SCREEN_W * scale), int(SCREEN_H * scale)
+        offset_x = (window_width - rendered_width) // 2
+        offset_y = (window_height - rendered_height) // 2
+        x = (position[0] - offset_x) / max(scale, 0.001)
+        y = (position[1] - offset_y) / max(scale, 0.001)
+        return max(0, min(SCREEN_W - 1, int(x))), max(0, min(SCREEN_H - 1, int(y)))
+
+    def toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        if self.fullscreen:
+            self.windowed_size = self.window.get_size()
+            self.window = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        else:
+            width = max(SCREEN_W, self.windowed_size[0])
+            height = max(SCREEN_H, self.windowed_size[1])
+            self.window = pygame.display.set_mode((width, height), pygame.RESIZABLE)
+
+    def resize_window(self, width, height):
+        if self.fullscreen:
+            return
+        self.windowed_size = (max(640, width), max(480, height))
+        self.window = pygame.display.set_mode(self.windowed_size, pygame.RESIZABLE)
+
+    def present(self):
+        window_width, window_height = self.window.get_size()
+        scale = min(window_width / SCREEN_W, window_height / SCREEN_H)
+        rendered_size = (max(1, int(SCREEN_W * scale)), max(1, int(SCREEN_H * scale)))
+        rendered = pygame.transform.smoothscale(self.screen, rendered_size)
+        self.window.fill((5, 10, 16))
+        self.window.blit(rendered, rendered.get_rect(center=self.window.get_rect().center))
+        pygame.display.flip()
 
     def screen_to_world(self, pos):
         camera_x, camera_y = self.player_screen_pos()
@@ -543,51 +758,124 @@ class Brawler:
             })
 
     def burst(self):
-        player = self.player
-        if player is None or player["super"] < 100:
+        if self.player is None:
             return
-        player["super"] = 0
-        defeated = []
-        for bot in self.bots:
-            dx, dy = bot["x"] - player["x"], bot["y"] - player["y"]
+        self.activate_super(
+            "host" if self.network_role == "host" else "player",
+            self.player,
+            self.screen_to_world(self.logical_mouse_pos()),
+        )
+
+    def activate_super(self, attacker_id, attacker, aim):
+        if attacker["hp"] <= 0 or attacker["super"] < 100:
+            return
+        attacker["super"] = 0
+        brawler_index = attacker["brawler"]
+        if brawler_index == 1:
+            stats = BRAWLERS[brawler_index]
+            base_angle = math.atan2(aim[1] - attacker["y"], aim[0] - attacker["x"])
+            for offset in (-0.28, -0.14, 0, 0.14, 0.28):
+                target = (
+                    attacker["x"] + math.cos(base_angle + offset) * 500,
+                    attacker["y"] + math.sin(base_angle + offset) * 500,
+                )
+                self.shoot(
+                    attacker, target, attacker_id,
+                    stats["bullet_speed"] * 1.3,
+                    stats["damage"] * 1.5,
+                    stats["color"],
+                )
+        elif brawler_index == 3:
+            self.activate_lynx_dash(attacker_id, attacker, aim)
+        else:
+            radius, damage, movement = {
+                0: (190, 38, 45),
+                2: (240, 55, 78),
+                4: (350, 28, -100),
+            }[brawler_index]
+            self.apply_area_super(attacker_id, attacker, radius, damage, movement)
+        self.add_burst_particles(attacker["x"], attacker["y"])
+        self.check_match_winner()
+        self.send_network_state(0, force=True)
+
+    def apply_area_super(self, attacker_id, attacker, radius, damage, movement):
+        targets = [
+            (f"bot_{index}", bot)
+            for index, bot in enumerate(self.bots)
+        ]
+        if self.network_role == "host":
+            targets.extend(
+                (player_id, fighter)
+                for player_id, fighter in (("host", self.player), *self.remote_players.items())
+            )
+        defeated_bots = []
+        for target_id, target in targets:
+            if target_id == attacker_id or target["hp"] <= 0:
+                continue
+            dx, dy = target["x"] - attacker["x"], target["y"] - attacker["y"]
             distance = math.hypot(dx, dy)
-            if distance <= 185 and not line_hits_wall(
-                (int(player["x"]), int(player["y"])),
-                (int(bot["x"]), int(bot["y"])),
+            if distance > radius or line_hits_wall(
+                (int(attacker["x"]), int(attacker["y"])),
+                (int(target["x"]), int(target["y"])),
             ):
-                bot["hp"] -= 38
-                bot["hurt_timer"] = 0.15
-                if distance:
-                    bot["x"], bot["y"] = move_circle(
-                        bot["x"], bot["y"], dx / distance * 45, dy / distance * 45, bot["radius"]
+                continue
+            target["hp"] = max(0, target["hp"] - damage)
+            target["hurt_timer"] = 0.25
+            target["flash"] = 0.2
+            if distance:
+                movement_amount = movement
+                if movement < 0:
+                    movement_amount = -min(
+                        -movement,
+                        max(0, distance - attacker["radius"] - target["radius"]),
                     )
-                if bot["hp"] <= 0:
-                    defeated.append(bot)
-        if self.network_role == "host" and self.opponent is not None:
-            opponent = self.opponent
-            dx, dy = opponent["x"] - player["x"], opponent["y"] - player["y"]
-            distance = math.hypot(dx, dy)
-            if distance <= 185 and not line_hits_wall(
-                (int(player["x"]), int(player["y"])),
-                (int(opponent["x"]), int(opponent["y"])),
-            ):
-                opponent["hp"] -= 38
-                opponent["hurt_timer"] = 0.2
-                opponent["flash"] = 0.15
-                if distance:
-                    opponent["x"], opponent["y"] = move_circle(
-                        opponent["x"], opponent["y"],
-                        dx / distance * 45, dy / distance * 45, opponent["radius"],
-                    )
-                if opponent["hp"] <= 0:
-                    opponent["hp"] = 0
-                    player["kills"] += 1
-                    self.game_state = "won"
-        for bot in defeated:
+                target["x"], target["y"] = move_circle(
+                    target["x"], target["y"],
+                    dx / distance * movement_amount,
+                    dy / distance * movement_amount,
+                    target["radius"],
+                )
+            if target["hp"] == 0:
+                if target_id.startswith("bot_"):
+                    defeated_bots.append(target)
+                else:
+                    attacker["kills"] += 1
+        for bot in defeated_bots:
             self.defeat_bot(bot)
-        self.add_burst_particles(player["x"], player["y"])
-        if self.game_state != "playing":
-            self.send_network_state(0, force=True)
+
+    def activate_lynx_dash(self, attacker_id, attacker, aim):
+        dx, dy = aim[0] - attacker["x"], aim[1] - attacker["y"]
+        distance = max(1, math.hypot(dx, dy))
+        dx, dy = dx / distance, dy / distance
+        start = (attacker["x"], attacker["y"])
+        attacker["x"], attacker["y"] = move_circle(
+            attacker["x"], attacker["y"], dx * 300, dy * 300, attacker["radius"]
+        )
+        attacker["dash_timer"] = 0.16
+        attacker["dash_dir"] = (dx, dy)
+        attacker["dash_cooldown"] = 1.2
+        end = (attacker["x"], attacker["y"])
+        defeated_bots = []
+        for bot in self.bots:
+            if math.hypot(bot["x"] - attacker["x"], bot["y"] - attacker["y"]) <= 78:
+                bot["hp"] = max(0, bot["hp"] - 42)
+                bot["hurt_timer"] = 0.25
+                if bot["hp"] == 0:
+                    defeated_bots.append(bot)
+        if self.network_role == "host":
+            for target_id, target in (("host", self.player), *self.remote_players.items()):
+                if target_id == attacker_id or target["hp"] <= 0:
+                    continue
+                if math.hypot(target["x"] - attacker["x"], target["y"] - attacker["y"]) <= 78:
+                    target["hp"] = max(0, target["hp"] - 42)
+                    target["hurt_timer"] = 0.25
+                    target["flash"] = 0.2
+                    if target["hp"] == 0:
+                        attacker["kills"] += 1
+        for bot in defeated_bots:
+            self.defeat_bot(bot)
+        self.add_burst_particles(*start, count=12, colors=(BRAWLERS[3]["color"], (255, 255, 255)))
+        self.add_burst_particles(*end, count=20, colors=(BRAWLERS[3]["color"], (255, 255, 255)))
 
     def defeat_bot(self, bot):
         if bot not in self.bots:
@@ -621,6 +909,9 @@ class Brawler:
         mx = float(keys[pygame.K_d] or keys[pygame.K_RIGHT]) - float(keys[pygame.K_a] or keys[pygame.K_LEFT])
         my = float(keys[pygame.K_s] or keys[pygame.K_DOWN]) - float(keys[pygame.K_w] or keys[pygame.K_UP])
         magnitude = math.hypot(mx, my)
+        if player["hp"] <= 0:
+            mx, my, magnitude = 0, 0, 0
+            player["dash_timer"] = 0
         player["move_amount"] = min(1, magnitude)
         player["move_phase"] += dt * (13 if magnitude else 3)
         if magnitude:
@@ -639,11 +930,12 @@ class Brawler:
                 player["radius"],
             )
 
-        if pygame.mouse.get_pressed()[0] and player["cooldown"] <= 0:
-            target = self.screen_to_world(pygame.mouse.get_pos())
+        if player["hp"] > 0 and pygame.mouse.get_pressed()[0] and player["cooldown"] <= 0:
+            target = self.screen_to_world(self.logical_mouse_pos())
             brawler = BRAWLERS[player["brawler"]]
             damage = brawler["damage"] * (1 + player["cubes"] * 0.08)
-            self.shoot(player, target, "player", brawler["bullet_speed"], damage, brawler["color"])
+            owner = "host" if self.network_role == "host" else "player"
+            self.shoot(player, target, owner, brawler["bullet_speed"], damage, brawler["color"])
             if player["brawler"] == 1:
                 dx, dy = target[0] - player["x"], target[1] - player["y"]
                 length = max(1, math.hypot(dx, dy))
@@ -652,11 +944,12 @@ class Brawler:
                     target[0] - dy / length * offset,
                     target[1] + dx / length * offset,
                 )
-                self.shoot(player, side_target, "player", brawler["bullet_speed"], damage, brawler["color"])
+                self.shoot(player, side_target, owner, brawler["bullet_speed"], damage, brawler["color"])
             player["cooldown"] = brawler["fire_rate"]
 
         if self.network_role == "host":
-            self.update_opponent(dt)
+            for player_id, fighter in list(self.remote_players.items()):
+                self.update_remote_player(player_id, fighter, self.remote_input.get(player_id, {}), dt)
 
         for bot in self.bots:
             bot["cooldown"] = max(0, bot["cooldown"] - dt)
@@ -704,46 +997,52 @@ class Brawler:
             ):
                 self.projectiles.remove(projectile)
                 continue
-            if projectile["owner"] == "player":
+            player_owner = projectile["owner"] in ("player", "host") or projectile["owner"] in self.remote_players
+            if projectile["owner"] in ("player", "host") and self.network_role is None:
                 target = next((
                     bot for bot in self.bots
                     if math.hypot(projectile["x"] - bot["x"], projectile["y"] - bot["y"])
                     < bot["radius"] + projectile["radius"]
                 ), None)
-                if target is None and self.network_role == "host" and math.hypot(
-                    projectile["x"] - self.opponent["x"],
-                    projectile["y"] - self.opponent["y"],
-                ) < self.opponent["radius"] + projectile["radius"]:
-                    target = self.opponent
                 if target is not None:
-                    target["hp"] -= projectile["damage"]
+                    target["hp"] = max(0, target["hp"] - projectile["damage"])
                     target["hurt_timer"] = 0.13
                     target["flash"] = 0.12
                     self.add_burst_particles(projectile["x"], projectile["y"], count=5)
                     player["super"] = min(100, player["super"] + 18)
                     self.projectiles.remove(projectile)
-                    if target is self.opponent:
-                        if target["hp"] <= 0:
-                            target["hp"] = 0
-                            self.game_state = "won"
-                            player["kills"] += 1
-                    elif target["hp"] <= 0:
+                    if target["hp"] <= 0:
                         self.defeat_bot(target)
-            elif projectile["owner"] in ("bot", "opponent") and math.hypot(
+            elif player_owner and self.network_role == "host":
+                attacker = self.player if projectile["owner"] == "host" else self.remote_players[projectile["owner"]]
+                target = next((
+                    (target_id, fighter)
+                    for target_id, fighter in (("host", self.player), *self.remote_players.items())
+                    if target_id != projectile["owner"]
+                    and fighter["hp"] > 0
+                    and math.hypot(projectile["x"] - fighter["x"], projectile["y"] - fighter["y"])
+                    < fighter["radius"] + projectile["radius"]
+                ), None)
+                if target is not None:
+                    target_id, fighter = target
+                    fighter["hp"] = max(0, fighter["hp"] - projectile["damage"])
+                    fighter["hurt_timer"] = 0.55
+                    fighter["flash"] = 0.12
+                    attacker["super"] = min(100, attacker["super"] + 18)
+                    if fighter["hp"] <= 0:
+                        attacker["kills"] += 1
+                    self.add_burst_particles(projectile["x"], projectile["y"], count=7, colors=((255, 108, 122), (255, 230, 230)))
+                    self.projectiles.remove(projectile)
+            elif projectile["owner"] == "bot" and math.hypot(
                 projectile["x"] - player["x"], projectile["y"] - player["y"]
             ) < player["radius"] + projectile["radius"]:
-                player["hp"] -= projectile["damage"]
+                player["hp"] = max(0, player["hp"] - projectile["damage"])
                 player["hurt_timer"] = 0.55
                 self.add_burst_particles(projectile["x"], projectile["y"], count=7, colors=((255, 108, 122), (255, 230, 230)))
                 self.projectiles.remove(projectile)
-                if projectile["owner"] == "opponent":
-                    self.opponent["super"] = min(100, self.opponent["super"] + 18)
-                    self.opponent["flash"] = 0.12
                 if player["hp"] <= 0:
-                    player["hp"] = 0
                     self.game_state = "lost"
-                    if projectile["owner"] == "opponent":
-                        self.opponent["kills"] += 1
+        self.check_match_winner()
 
         for cube in self.cubes[:]:
             cube["phase"] += dt * 3
@@ -756,13 +1055,16 @@ class Brawler:
                 self.add_burst_particles(cube["x"], cube["y"], count=18)
 
         if self.network_role == "host" and self.game_state == "playing":
-            for cube in self.cubes[:]:
-                if math.hypot(cube["x"] - self.opponent["x"], cube["y"] - self.opponent["y"]) < self.opponent["radius"] + 25:
-                    self.cubes.remove(cube)
-                    self.opponent["cubes"] += 1
-                    self.opponent["max_hp"] = BRAWLERS[self.opponent["brawler"]]["hp"] + self.opponent["cubes"] * 10
-                    self.opponent["hp"] = min(self.opponent["max_hp"], self.opponent["hp"] + 15)
-                    self.add_burst_particles(cube["x"], cube["y"], count=18)
+            for player_id, fighter in (("host", self.player), *self.remote_players.items()):
+                if player_id == "host":
+                    continue
+                for cube in self.cubes[:]:
+                    if fighter["hp"] > 0 and math.hypot(cube["x"] - fighter["x"], cube["y"] - fighter["y"]) < fighter["radius"] + 25:
+                        self.cubes.remove(cube)
+                        fighter["cubes"] += 1
+                        fighter["max_hp"] = BRAWLERS[fighter["brawler"]]["hp"] + fighter["cubes"] * 10
+                        fighter["hp"] = min(fighter["max_hp"], fighter["hp"] + 15)
+                        self.add_burst_particles(cube["x"], cube["y"], count=18)
 
         if self.network_role is None and len(self.bots) < 4 and self.game_state == "playing":
             self.spawn_timer += dt
@@ -770,10 +1072,12 @@ class Brawler:
                 self.spawn_timer = 0
                 self.spawn_bot()
 
-        if player["hurt_timer"] <= 0 and player["hp"] < player["max_hp"]:
+        if player["hp"] > 0 and player["hurt_timer"] <= 0 and player["hp"] < player["max_hp"]:
             player["hp"] = min(player["max_hp"], player["hp"] + 5 * dt)
-        if self.network_role == "host" and self.opponent["hurt_timer"] <= 0 and self.opponent["hp"] < self.opponent["max_hp"]:
-            self.opponent["hp"] = min(self.opponent["max_hp"], self.opponent["hp"] + 5 * dt)
+        if self.network_role == "host":
+            for fighter in self.remote_players.values():
+                if fighter["hp"] > 0 and fighter["hurt_timer"] <= 0 and fighter["hp"] < fighter["max_hp"]:
+                    fighter["hp"] = min(fighter["max_hp"], fighter["hp"] + 5 * dt)
 
         for particle in self.particles[:]:
             particle["x"] += particle["vx"] * dt
@@ -783,9 +1087,21 @@ class Brawler:
                 self.particles.remove(particle)
         self.send_network_state(dt, force=self.game_state != "playing")
 
-    def update_opponent(self, dt):
-        opponent = self.opponent
-        controls = self.remote_input
+    def check_match_winner(self):
+        if self.network_role != "host" or self.game_state != "playing":
+            return
+        alive = [
+            player_id
+            for player_id, fighter in (("host", self.player), *self.remote_players.items())
+            if fighter["hp"] > 0
+        ]
+        if len(alive) <= 1:
+            self.winner_id = alive[0] if alive else None
+            self.game_state = "won" if self.winner_id == "host" else "lost"
+
+    def update_remote_player(self, player_id, opponent, controls, dt):
+        if opponent["hp"] <= 0:
+            return
         opponent["cooldown"] = max(0, opponent["cooldown"] - dt)
         opponent["hurt_timer"] = max(0, opponent["hurt_timer"] - dt)
         opponent["flash"] = max(0, opponent["flash"] - dt)
@@ -802,6 +1118,7 @@ class Brawler:
         length = math.hypot(mx, my)
         if length > 1:
             mx, my = mx / length, my / length
+            length = 1
         opponent["move_amount"] = min(1, math.hypot(mx, my))
         opponent["move_phase"] += dt * (13 if opponent["move_amount"] else 3)
 
@@ -809,7 +1126,12 @@ class Brawler:
             if length:
                 direction = (mx / max(length, 1), my / max(length, 1))
             else:
-                direction = (self.player["x"] - opponent["x"], self.player["y"] - opponent["y"])
+                targets = [
+                    fighter for other_id, fighter in (("host", self.player), *self.remote_players.items())
+                    if other_id != player_id and fighter["hp"] > 0
+                ]
+                target = min(targets, key=lambda fighter: math.hypot(fighter["x"] - opponent["x"], fighter["y"] - opponent["y"]), default=self.player)
+                direction = (target["x"] - opponent["x"], target["y"] - opponent["y"])
                 distance = max(1, math.hypot(*direction))
                 direction = (direction[0] / distance, direction[1] / distance)
             opponent["dash_dir"] = direction
@@ -837,30 +1159,15 @@ class Brawler:
         if controls.get("fire") and opponent["cooldown"] <= 0:
             stats = BRAWLERS[opponent["brawler"]]
             damage = stats["damage"] * (1 + opponent["cubes"] * 0.08)
-            self.shoot(opponent, aim, "opponent", stats["bullet_speed"], damage, stats["color"])
+            self.shoot(opponent, aim, player_id, stats["bullet_speed"], damage, stats["color"])
             opponent["cooldown"] = stats["fire_rate"]
 
-        if controls.get("super"):
-            if opponent["super"] >= 100:
-                opponent["super"] = 0
-                dx = self.player["x"] - opponent["x"]
-                dy = self.player["y"] - opponent["y"]
-                if math.hypot(dx, dy) <= 185 and not line_hits_wall(
-                    (int(opponent["x"]), int(opponent["y"])),
-                    (int(self.player["x"]), int(self.player["y"])),
-                ):
-                    self.player["hp"] -= 38
-                    self.player["hurt_timer"] = 0.3
-                    if self.player["hp"] <= 0:
-                        self.player["hp"] = 0
-                        self.game_state = "lost"
-                        opponent["kills"] += 1
-                self.add_burst_particles(opponent["x"], opponent["y"])
+        if controls.get("super") and opponent["super"] >= 100:
+            self.activate_super(player_id, opponent, aim)
 
     def return_to_menu(self):
         self.stop_network()
         self.player = None
-        self.opponent = None
         self.bots = []
         self.projectiles = []
         self.particles = []
@@ -871,13 +1178,22 @@ class Brawler:
     def handle_event(self, event):
         if event.type == pygame.QUIT:
             return False
+        if event.type == pygame.VIDEORESIZE:
+            self.resize_window(event.w, event.h)
+            return True
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_F11:
+            self.toggle_fullscreen()
+            return True
         if event.type == pygame.TEXTINPUT and self.game_state == "menu" and self.editing_ip:
-            if len(self.ip_address) + len(event.text) <= 45:
-                self.ip_address += event.text
+            current_address = "" if self.ip_input_selected else self.ip_address
+            if len(current_address) + len(event.text) <= 15:
+                self.ip_address = current_address + event.text
+            self.ip_input_selected = False
             return True
         if event.type == pygame.KEYDOWN:
             if self.game_state == "menu" and self.editing_ip and event.key == pygame.K_ESCAPE:
                 self.editing_ip = False
+                self.ip_input_selected = False
                 pygame.key.stop_text_input()
                 return True
             if event.key == pygame.K_ESCAPE:
@@ -885,7 +1201,10 @@ class Brawler:
                     return False
                 self.return_to_menu()
                 return True
-            if event.key == pygame.K_r and self.game_state in ("won", "lost", "disconnected"):
+            if event.key == pygame.K_r and self.game_state == "disconnected":
+                self.return_to_menu()
+                return True
+            if event.key == pygame.K_r and self.game_state in ("won", "lost"):
                 if self.network_role == "client" and self.network is not None:
                     self.network.send({"type": "restart"})
                     self.game_state = "connecting"
@@ -897,11 +1216,15 @@ class Brawler:
                 return True
             if self.game_state == "menu":
                 if self.editing_ip and event.key == pygame.K_BACKSPACE:
-                    self.ip_address = self.ip_address[:-1]
+                    self.ip_address = "" if self.ip_input_selected else self.ip_address[:-1]
+                    self.ip_input_selected = False
                 elif self.editing_ip and event.key == pygame.K_RETURN:
                     self.editing_ip = False
+                    self.ip_input_selected = False
                     pygame.key.stop_text_input()
-                elif not self.editing_ip and event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
+                elif not self.editing_ip and event.key in (
+                    pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5
+                ):
                     self.selected_brawler = event.key - pygame.K_1
                 elif not self.editing_ip and event.key in (pygame.K_LEFT, pygame.K_a):
                     self.selected_brawler = (self.selected_brawler - 1) % len(BRAWLERS)
@@ -911,7 +1234,7 @@ class Brawler:
                     self.network_role = None
                     self.start_game()
                 return True
-            if event.key == pygame.K_SPACE and self.game_state == "playing":
+            if event.key == pygame.K_SPACE and self.game_state == "playing" and self.player["hp"] > 0:
                 if self.network_role == "client":
                     if self.player["super"] >= 100:
                         self.super_pending = True
@@ -926,7 +1249,7 @@ class Brawler:
                     dy = float(keys[pygame.K_s] or keys[pygame.K_DOWN]) - float(keys[pygame.K_w] or keys[pygame.K_UP])
                     length = math.hypot(dx, dy)
                     if length == 0:
-                        target = self.screen_to_world(pygame.mouse.get_pos())
+                        target = self.screen_to_world(self.logical_mouse_pos())
                         dx, dy = target[0] - self.player["x"], target[1] - self.player["y"]
                         length = max(1, math.hypot(dx, dy))
                     if self.player["dash_cooldown"] <= 0:
@@ -934,24 +1257,34 @@ class Brawler:
                         self.player["dash_timer"] = 0.16
                         self.player["dash_cooldown"] = 1.2
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.game_state == "menu":
+            mouse_pos = self.logical_mouse_pos(event.pos)
             for index in range(len(BRAWLERS)):
-                if self.character_card_rect(index).collidepoint(event.pos):
+                if self.character_card_rect(index).collidepoint(mouse_pos):
                     self.selected_brawler = index
                     return True
-            if self.host_button_rect().collidepoint(event.pos):
+            if self.host_button_rect().collidepoint(mouse_pos):
                 self.editing_ip = False
+                self.ip_input_selected = False
+                pygame.key.stop_text_input()
                 self.start_host()
-            elif self.join_button_rect().collidepoint(event.pos):
+            elif self.join_button_rect().collidepoint(mouse_pos):
                 self.editing_ip = False
+                self.ip_input_selected = False
+                pygame.key.stop_text_input()
                 self.start_join()
-            elif self.local_button_rect().collidepoint(event.pos):
+            elif self.local_button_rect().collidepoint(mouse_pos):
                 self.network_role = None
+                self.editing_ip = False
+                self.ip_input_selected = False
+                pygame.key.stop_text_input()
                 self.start_game()
-            elif self.ip_field_rect().collidepoint(event.pos):
+            elif self.ip_field_rect().collidepoint(mouse_pos):
                 self.editing_ip = True
+                self.ip_input_selected = True
                 pygame.key.start_text_input()
             else:
                 self.editing_ip = False
+                self.ip_input_selected = False
                 pygame.key.stop_text_input()
         return True
 
@@ -973,7 +1306,7 @@ class Brawler:
 
     @staticmethod
     def character_card_rect(index):
-        return pygame.Rect(95 + index * 260, 285, 230, 215)
+        return pygame.Rect(31 + index * 183, 285, 166, 215)
 
     def draw_bar(self, x, y, width, height, ratio, color, background=(43, 47, 59)):
         pygame.draw.rect(self.screen, background, (x, y, width, height), border_radius=height // 2)
@@ -984,8 +1317,54 @@ class Brawler:
                 border_radius=height // 2,
             )
 
+    @staticmethod
+    def wrap_text(font, text, max_width, max_lines):
+        lines = []
+        current = ""
+        for word in str(text).split():
+            candidate = f"{current} {word}".strip()
+            if font.size(candidate)[0] <= max_width:
+                current = candidate
+                continue
+            if current:
+                lines.append(current)
+                current = ""
+            while word and font.size(word)[0] > max_width:
+                split_at = 1
+                while split_at < len(word) and font.size(word[:split_at + 1])[0] <= max_width:
+                    split_at += 1
+                lines.append(word[:split_at])
+                word = word[split_at:]
+            current = word
+            if len(lines) >= max_lines:
+                break
+        if current and len(lines) < max_lines:
+            lines.append(current)
+        all_words = " ".join(lines).split()
+        if " ".join(all_words) != str(text).strip() and lines:
+            last = lines[-1]
+            while last and font.size(last + "...")[0] > max_width:
+                last = last[:-1]
+            lines[-1] = last.rstrip() + "..."
+        return lines[:max_lines]
+
+    def draw_text_box(self, text, font, color, rect, max_lines=1, centered=False, line_spacing=0):
+        rect = pygame.Rect(rect)
+        lines = self.wrap_text(font, text, rect.width, max_lines)
+        previous_clip = self.screen.get_clip()
+        self.screen.set_clip(previous_clip.clip(rect))
+        line_height = font.get_linesize() + line_spacing
+        total_height = len(lines) * line_height - line_spacing
+        y = rect.y + max(0, (rect.height - total_height) // 2)
+        for line in lines:
+            surface = font.render(line, True, color)
+            x = rect.centerx - surface.get_width() // 2 if centered else rect.x
+            self.screen.blit(surface, (x, y))
+            y += line_height
+        self.screen.set_clip(previous_clip)
+
     def draw_menu(self):
-        mouse_x, mouse_y = pygame.mouse.get_pos()
+        mouse_x, mouse_y = self.logical_mouse_pos()
         self.screen.fill((10, 18, 28))
 
         glow = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
@@ -1007,11 +1386,11 @@ class Brawler:
         self.screen.blit(panel, panel_rect)
         pygame.draw.rect(self.screen, (76, 112, 142), panel_rect, 1, border_radius=24)
 
-        title = self.title_font.render("NEON BRAWL", True, (239, 247, 255))
-        self.screen.blit(title, title.get_rect(center=(SCREEN_W // 2, 92)))
-
-        subtitle = self.font.render("DREI HELDEN. EINE ARENA. WIE LANGE UEBERLEBST DU?", True, (166, 204, 222))
-        self.screen.blit(subtitle, subtitle.get_rect(center=(SCREEN_W // 2, 142)))
+        self.draw_text_box("NEON BRAWL", self.title_font, (239, 247, 255), (80, 62, 800, 62), centered=True)
+        self.draw_text_box(
+            "FUENF HELDEN. EINE ARENA. WIE LANGE UEBERLEBST DU?",
+            self.font, (166, 204, 222), (80, 126, 800, 32), centered=True,
+        )
 
         for index, brawler in enumerate(BRAWLERS):
             rect = self.character_card_rect(index)
@@ -1024,8 +1403,6 @@ class Brawler:
             glow_color = brawler["color"] if selected else (72, 94, 118)
             glow_width = 4 if selected else 2
             pygame.draw.rect(self.screen, glow_color, rect, glow_width, border_radius=22)
-            if selected:
-                pygame.draw.rect(self.screen, (*brawler["color"], 80), rect.inflate(10, 10), 0, border_radius=25)
 
             cx = rect.centerx
             cy = rect.y + 60 + int(math.sin(self.animation_time * 3 + index) * 5)
@@ -1037,15 +1414,23 @@ class Brawler:
             }
             self.draw_brawler(preview, 0, 0, is_player=True, menu_preview=True)
 
-            name = self.font.render(brawler["name"], True, (244, 249, 255))
-            self.screen.blit(name, name.get_rect(center=(cx, rect.y + 118)))
-            desc = self.small_font.render(brawler["description"], True, (180, 205, 220))
-            self.screen.blit(desc, desc.get_rect(center=(cx, rect.y + 148)))
+            self.draw_text_box(
+                brawler["name"], self.font, (244, 249, 255),
+                (rect.x + 8, rect.y + 102, rect.width - 16, 26), centered=True,
+            )
+            self.draw_text_box(
+                brawler["super_name"], self.small_font, brawler["color"],
+                (rect.x + 7, rect.y + 129, rect.width - 14, 22), centered=True,
+            )
+            self.draw_text_box(
+                brawler["super_description"], self.small_font, (180, 205, 220),
+                (rect.x + 8, rect.y + 151, rect.width - 16, 36), max_lines=2, centered=True,
+            )
 
-            self.screen.blit(self.small_font.render("LEBEN", True, (166, 192, 207)), (rect.x + 20, rect.y + 171))
-            self.draw_bar(rect.x + 86, rect.y + 175, 120, 8, brawler["hp"] / 145, brawler["color"])
-            self.screen.blit(self.small_font.render("ANGRIFF", True, (166, 192, 207)), (rect.x + 20, rect.y + 190))
-            self.draw_bar(rect.x + 86, rect.y + 194, 120, 8, brawler["damage"] / 38, (255, 194, 111))
+            self.draw_text_box("HP", self.small_font, (166, 192, 207), (rect.x + 9, rect.y + 185, 27, 20))
+            self.draw_bar(rect.x + 38, rect.y + 191, 116, 8, brawler["hp"] / 145, brawler["color"])
+            self.draw_text_box("DMG", self.small_font, (166, 192, 207), (rect.x + 4, rect.y + 203, 34, 12))
+            self.draw_bar(rect.x + 38, rect.y + 207, 116, 8, brawler["damage"] / 38, (255, 194, 111))
 
             number_surface = self.small_font.render(str(index + 1), True, (151, 180, 196))
             self.screen.blit(number_surface, (rect.x + 16, rect.y + 14))
@@ -1064,8 +1449,10 @@ class Brawler:
                 pygame.draw.rect(self.screen, (255, 255, 255), rect, 2, border_radius=16)
             else:
                 pygame.draw.rect(self.screen, color, rect, 2, border_radius=16)
-            text = self.small_font.render(label, True, (241, 247, 254))
-            self.screen.blit(text, text.get_rect(center=rect.center))
+            self.draw_text_box(
+                label, self.small_font, (241, 247, 254),
+                rect.inflate(-10, -8), centered=True,
+            )
 
         field = self.ip_field_rect()
         field_color = (51, 74, 96) if self.editing_ip else (31, 46, 62)
@@ -1073,8 +1460,17 @@ class Brawler:
         pygame.draw.rect(self.screen, (110, 156, 192), field, 2, border_radius=12)
         ip_label = self.small_font.render("HOST-IP:", True, (176, 204, 221))
         self.screen.blit(ip_label, (field.x - 82, field.y + 10))
-        ip_text = self.font.render(self.ip_address or "IP eingeben", True, (238, 246, 252))
-        self.screen.blit(ip_text, (field.x + 13, field.y + 7))
+        visible_ip = self.ip_address or "IPv4 des Hosts eingeben"
+        ip_text = self.font.render(visible_ip, True, (238, 246, 252))
+        if ip_text.get_width() > field.width - 26:
+            ip_text = self.small_font.render(visible_ip, True, (238, 246, 252))
+        if self.editing_ip and self.ip_input_selected and self.ip_address:
+            selection = pygame.Rect(field.x + 10, field.y + 5, ip_text.get_width() + 6, ip_text.get_height() + 6)
+            pygame.draw.rect(self.screen, (73, 112, 145), selection, border_radius=4)
+        ip_clip = self.screen.get_clip()
+        self.screen.set_clip(ip_clip.clip(field.inflate(-8, -4)))
+        self.screen.blit(ip_text, (field.x + 13, field.centery - ip_text.get_height() // 2))
+        self.screen.set_clip(ip_clip)
         if self.editing_ip and int(self.animation_time * 2) % 2 == 0:
             cursor_x = field.x + 13 + ip_text.get_width() + 2
             pygame.draw.line(self.screen, (242, 247, 255), (cursor_x, field.y + 8), (cursor_x, field.bottom - 8), 2)
@@ -1083,29 +1479,41 @@ class Brawler:
             status = self.network_status
             if self.network_role == "host":
                 status = f"{self.network_status}  (IP: {self.get_local_ip()})"
-            status_surface = self.small_font.render(status, True, (255, 219, 138))
-            self.screen.blit(status_surface, status_surface.get_rect(center=(SCREEN_W // 2, 663)))
-        elif self.network_error:
-            error_surface = self.small_font.render(self.network_error[:90], True, (255, 135, 143))
-            self.screen.blit(error_surface, error_surface.get_rect(center=(SCREEN_W // 2, 663)))
-        else:
-            controls = self.small_font.render(
-                "WASD: Bewegen   Maus: Zielen & Schiessen   SPACE: Dash / Super",
-                True,
-                (160, 189, 205),
+            self.draw_text_box(
+                status, self.small_font, (255, 219, 138),
+                (70, 644, 820, 30), centered=True,
             )
-            self.screen.blit(controls, controls.get_rect(center=(SCREEN_W // 2, 663)))
-        pygame.display.flip()
+        elif self.network_error:
+            self.draw_text_box(
+                self.network_error, self.small_font, (255, 135, 143),
+                (70, 644, 820, 30), centered=True,
+            )
+        else:
+            self.draw_text_box(
+                "WASD: Bewegen   Maus: Zielen & Schiessen   SPACE: Dash / Super   F11: Vollbild",
+                self.small_font, (160, 189, 205),
+                (45, 644, 870, 30), centered=True,
+            )
+        self.present()
 
     @staticmethod
     def get_local_ip():
         try:
+            # A UDP connect selects the active route without sending a packet.
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route_socket:
+                route_socket.connect(("192.0.2.1", 9))
+                address = route_socket.getsockname()[0]
+                if address and not address.startswith(("127.", "169.254.")):
+                    return address
+        except OSError:
+            pass
+        try:
             addresses = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
             for address in addresses:
                 ip = address[4][0]
-                if not ip.startswith("127."):
+                if not ip.startswith(("127.", "169.254.")):
                     return ip
-            return "127.0.0.1"
+            return "Keine LAN-IP gefunden"
         except OSError:
             return "IP nicht verfuegbar"
 
@@ -1148,7 +1556,7 @@ class Brawler:
             if menu_preview:
                 angle = -math.pi / 4
             else:
-                aim_x, aim_y = pygame.mouse.get_pos()
+                aim_x, aim_y = self.logical_mouse_pos()
                 angle = math.atan2(aim_y - sy, aim_x - sx)
         else:
             dx, dy = self.player["x"] - entity["x"], self.player["y"] - entity["y"]
@@ -1184,7 +1592,7 @@ class Brawler:
             )
             pygame.draw.rect(self.screen, (95, 58, 23), (sx - 13, sy - 3, 26, 10), border_radius=5)
             pygame.draw.line(self.screen, (255, 255, 224), (sx - 7, sy + 1), (sx + 7, sy + 1), 2)
-        else:
+        elif kind == 2:
             armor = pygame.Rect(sx - radius - 2, sy - radius, radius * 2 + 4, radius * 2 + 5)
             pygame.draw.rect(self.screen, (47, 38, 51), armor, border_radius=9)
             pygame.draw.rect(self.screen, body_color, armor.inflate(-5, -5), border_radius=7)
@@ -1193,6 +1601,23 @@ class Brawler:
             pygame.draw.line(self.screen, (85, 41, 51), (sx + 2, sy + 2), (sx + 6, sy), 2)
             pygame.draw.circle(self.screen, (255, 223, 112), (sx - radius - 1, sy + 2), 5)
             pygame.draw.circle(self.screen, (255, 223, 112), (sx + radius + 1, sy + 2), 5)
+        elif kind == 3:
+            pygame.draw.circle(self.screen, (24, 49, 48), (sx, sy), radius + 3)
+            pygame.draw.circle(self.screen, body_color, (sx, sy), radius)
+            pygame.draw.circle(self.screen, (211, 255, 231), (sx, sy), radius, 2)
+            pygame.draw.polygon(self.screen, (230, 255, 242), [
+                (sx - 12, sy - 11), (sx - 21, sy - 24), (sx - 5, sy - 17),
+            ])
+            pygame.draw.polygon(self.screen, (230, 255, 242), [
+                (sx + 12, sy - 11), (sx + 21, sy - 24), (sx + 5, sy - 17),
+            ])
+            pygame.draw.circle(self.screen, (244, 255, 248), (sx, sy + 2), 5)
+        else:
+            pygame.draw.circle(self.screen, (43, 35, 67), (sx, sy), radius + 4)
+            pygame.draw.circle(self.screen, body_color, (sx, sy), radius)
+            pygame.draw.circle(self.screen, (236, 222, 255), (sx, sy), radius, 2)
+            pygame.draw.circle(self.screen, (247, 242, 255), (sx, sy), 8, 2)
+            pygame.draw.ellipse(self.screen, (247, 242, 255), (sx - 20, sy - 7, 40, 14), 2)
 
         if not menu_preview:
             name = self.small_font.render(BRAWLERS[entity["brawler"]]["name"], True, (243, 247, 248))
@@ -1281,49 +1706,77 @@ class Brawler:
         self.screen.blit(self.font.render(BRAWLERS[player["brawler"]]["name"], True, (229, 246, 255)), (36, 27))
         self.draw_bar(37, 64, 170, 13, player["hp"] / player["max_hp"], (76, 224, 143))
         self.screen.blit(self.small_font.render(f"{int(player['hp'])} HP", True, (223, 239, 241)), (217, 60))
-        self.screen.blit(self.small_font.render(f"ELIMS  {self.kills}/10", True, (206, 224, 230)), (38, 81))
+        eliminations = f"ELIMS  {player['kills']}" if self.network_role is not None else f"ELIMS  {self.kills}/10"
+        self.screen.blit(self.small_font.render(eliminations, True, (206, 224, 230)), (38, 81))
         cube_label = self.small_font.render(f"POWER CUBES  x{player['cubes']}", True, (162, 255, 174))
         self.screen.blit(cube_label, (370, 31))
         if self.network_role is not None:
-            opponent = self.opponent
-            ox, oy = int(opponent["x"] - camera_x), int(opponent["y"] - camera_y)
-            self.draw_bar(ox - 27, oy - 40, 54, 7, opponent["hp"] / opponent["max_hp"], (255, 90, 111))
-            self.draw_brawler(opponent, camera_x, camera_y)
-            rival_label = self.small_font.render(
-                f"{BRAWLERS[opponent['brawler']]['name']}  x{opponent['cubes']}",
-                True, (255, 190, 188),
+            for player_id, fighter in self.remote_players.items():
+                if fighter["hp"] <= 0:
+                    continue
+                fx, fy = int(fighter["x"] - camera_x), int(fighter["y"] - camera_y)
+                self.draw_bar(fx - 25, fy - 39, 50, 7, fighter["hp"] / fighter["max_hp"], fighter["color"])
+                self.draw_brawler(fighter, camera_x, camera_y)
+                if -50 < fx < SCREEN_W + 50 and -50 < fy < SCREEN_H + 50:
+                    label = self.small_font.render(
+                        f"{BRAWLERS[fighter['brawler']]['name']}  x{fighter['cubes']}",
+                        True, (232, 242, 248),
+                    )
+                    self.screen.blit(label, label.get_rect(center=(fx, fy + 34)))
+            player_count = 1 + len(self.remote_players)
+            alive_count = sum(fighter["hp"] > 0 for fighter in (self.player, *self.remote_players.values()))
+            lobby_label = self.small_font.render(
+                f"Spieler {player_count}/{MAX_PLAYERS}   Verbleibend {alive_count}",
+                True, (219, 232, 241),
             )
-            self.screen.blit(rival_label, (370, 57))
-            self.draw_bar(20, 112, 180, 9, opponent["super"] / 100, (255, 187, 89), (40, 49, 62))
-            self.screen.blit(
-                self.small_font.render("GEGNER-SUPER", True, (255, 200, 180)),
-                (207, 106),
-            )
+            self.screen.blit(lobby_label, (SCREEN_W - lobby_label.get_width() - 20, 22))
 
         super_x, super_y = SCREEN_W - 210, SCREEN_H - 40
-        self.screen.blit(self.small_font.render("SUPER [SPACE]", True, (218, 233, 243)), (super_x, super_y - 23))
+        super_label = f"{BRAWLERS[player['brawler']]['super_name']} [SPACE]"
+        self.draw_text_box(
+            super_label, self.small_font, (218, 233, 243),
+            (SCREEN_W - 245, super_y - 29, 225, 25), centered=True,
+        )
         super_color = (255, 202, 75) if player["super"] >= 100 else (102, 197, 246)
         self.draw_bar(super_x, super_y, 176, 13, player["super"] / 100, super_color, (40, 49, 62))
         if player["super"] >= 100:
             pygame.draw.circle(self.screen, (255, 217, 90), (super_x + 190, super_y + 6), 7)
 
-        help_text = "WASD bewegen  |  Maus zielen & halten: schiessen  |  SPACE: Dash / Super"
-        help_surface = self.small_font.render(help_text, True, (208, 224, 230))
-        self.screen.blit(help_surface, help_surface.get_rect(center=(SCREEN_W // 2, SCREEN_H - 19)))
+        help_text = "WASD bewegen  |  Maus zielen & schiessen  |  SPACE: Dash/Super  |  F11: Vollbild"
+        self.draw_text_box(
+            help_text, self.small_font, (208, 224, 230),
+            (20, SCREEN_H - 35, SCREEN_W - 40, 30), centered=True,
+        )
 
         if self.game_state != "playing":
             overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
             overlay.fill((9, 15, 25, 205))
             self.screen.blit(overlay, (0, 0))
-            title = "SIEG!" if self.game_state == "won" else "AUSGESCHALTET"
-            subtitle = "Du hast die Arena gemeistert." if self.game_state == "won" else "Die Bots waren staerker."
-            title_surface = self.title_font.render(title, True, (237, 247, 255))
-            sub_surface = self.font.render(subtitle, True, (181, 201, 216))
-            restart = self.small_font.render("R: Nochmal spielen     ESC: Zurueck ins Menü", True, (134, 202, 234))
-            self.screen.blit(title_surface, title_surface.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 46)))
-            self.screen.blit(sub_surface, sub_surface.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 4)))
-            self.screen.blit(restart, restart.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 48)))
-        pygame.display.flip()
+            if self.game_state == "disconnected":
+                title = "VERBINDUNG GETRENNT"
+                subtitle = "Die Verbindung zum Mitspieler wurde beendet."
+                restart_text = "R oder ESC: Zurueck ins Menue"
+            elif self.game_state == "won":
+                title = "SIEG!"
+                subtitle = "Du bist der letzte Brawler in der Arena."
+                restart_text = "R: Nochmal spielen     ESC: Zurueck ins Menue"
+            else:
+                title = "AUSGESCHALTET"
+                subtitle = "Ein anderer Brawler hat gewonnen."
+                restart_text = "R: Nochmal spielen     ESC: Zurueck ins Menue"
+            self.draw_text_box(
+                title, self.title_font, (237, 247, 255),
+                (50, SCREEN_H // 2 - 82, SCREEN_W - 100, 68), centered=True,
+            )
+            self.draw_text_box(
+                subtitle, self.font, (181, 201, 216),
+                (70, SCREEN_H // 2 - 8, SCREEN_W - 140, 38), centered=True,
+            )
+            self.draw_text_box(
+                restart_text, self.small_font, (134, 202, 234),
+                (70, SCREEN_H // 2 + 35, SCREEN_W - 140, 36), centered=True,
+            )
+        self.present()
         return
 
         if not (-55 < x < SCREEN_W + 55 and -55 < y < SCREEN_H + 55):
